@@ -16,9 +16,9 @@ var verbose = flag.Bool("v", false, "Verbose mode.")
 var compress = flag.Bool("c", false, "Compress the content before encrypting it.")
 var recursive = flag.Bool("r", false, "If pointing to a folder, encrypt the folder content recursively (file by file).")
 var asSingleFile = flag.Bool("single", false, "If pointing to a folder, encrypt the folder content as a single encrypted file.")
-var salt = flag.String("salt", "", "Specify a custom encryption password salt.")
+var password = flag.String("password", "", "Specify the encryption password instead of prompting the std input (optional).")
+var salt = flag.String("salt", "", "Specify a custom password salt.")
 
-// loggerProxy is just like a regular log.Logger but supports extra settings.
 var logger *loggerProxy
 
 func main() {
@@ -43,13 +43,13 @@ func main() {
 		logger.Fatal(e)
 	}
 
-	password, e := getPassword()
+	pwd, e := getPassword()
 	if e != nil {
 		logger.Fatal(e)
 	}
 
 	// TODO: password shouldn't have to be cast.
-	encrypter, e := encrypt.NewEncrypter(string(password), salt)
+	encrypter, e := encrypt.NewEncrypter(string(pwd), salt)
 	if e != nil {
 		logger.Fatal(e)
 	}
@@ -91,6 +91,10 @@ func getSalt() ([]byte, error) {
 }
 
 func getPassword() ([]byte, error) {
+	if *password != "" {
+		return []byte(*password), nil
+	}
+
 	fmt.Print("Enter Password: ")
 	password, e := terminal.ReadPassword(int(syscall.Stdin))
 	fmt.Println()
