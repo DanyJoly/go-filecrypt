@@ -1,142 +1,105 @@
-package main
+package filecrypt
 
 import (
-	"flag"
 	"fmt"
-	"log"
+	"io"
 	"os"
-	"syscall"
+	"path/filepath"
 
 	encrypt "github.com/DanyJoly/go-encrypt"
-	"golang.org/x/crypto/ssh/terminal"
 )
 
-// Command line flags
-var verbose = flag.Bool("v", false, "Verbose mode.")
-var compress = flag.Bool("c", false, "Compress the content before encrypting it.")
-var recursive = flag.Bool("r", false, "If pointing to a folder, encrypt the folder content recursively (file by file).")
-var asSingleFile = flag.Bool("single", false, "If pointing to a folder, encrypt the folder content as a single encrypted file.")
-var password = flag.String("password", "", "Specify the encryption password instead of prompting the std input (optional).")
-var salt = flag.String("salt", "", "Specify a custom password salt.")
+// EncryptFile will encrypt the file at plainFilepath and put the content in the file at cypherFilepath.
+// If cypherFilepath already exists, it will overwrite its content. Otherwise it will create it and any subfolder
+// required.
+func EncryptFile(plainFilepath string, cypherFilepath string, encrypter *encrypt.Encrypter) error {
 
-var logger *loggerProxy
-
-func main() {
-
-	inputFile, outputFile := extractFlags()
-
-	logger = newLoggerProxy(os.Stdout, os.Args[0], log.Ltime, *verbose)
-	logger.SetFlags(log.Ltime)
-
-	stats, e := os.Stat(inputFile)
-	if e != nil {
-		logger.Fatal(e)
-	}
-
-	if stats.IsDir() && !*recursive && !*asSingleFile {
-		logger.Fatal("Input pointing to a folder and encrypting is neither recursive or as a single encrypted file.")
-	}
-
-	// Generate the encrypter
-	salt, e := getSalt()
-	if e != nil {
-		logger.Fatal(e)
-	}
-
-	pwd, e := getPassword()
-	if e != nil {
-		logger.Fatal(e)
-	}
-
-	// TODO: password shouldn't have to be cast.
-	encrypter, e := encrypt.NewEncrypter(string(pwd), salt)
-	if e != nil {
-		logger.Fatal(e)
-	}
-
-	if stats.IsDir() {
-		logger.Fatalln("TODO: Folder encryption not supported yet.")
-	}
-
-	e = encryptFile(inputFile, stats, outputFile, encrypter)
-	if e != nil {
-		logger.Fatal(e)
-	}
-}
-
-func extractFlags() (inputFilename string, outputFilename string) {
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "%s [OPTION]... [INPUT FILE]... [OUTPUT FILE]...\n", os.Args[0])
-		fmt.Fprint(os.Stderr, "\nParameters:\n")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-
-	if flag.NArg() < 2 {
-		flag.Usage()
-		os.Exit(-1)
-	}
-
-	return flag.Arg(0), flag.Arg(1)
-}
-
-func getSalt() ([]byte, error) {
-	// Use user-specified salt
-	if *salt != "" {
-		return []byte(*salt), nil
-	}
-
-	return encrypt.GenerateSalt()
-}
-
-func getPassword() ([]byte, error) {
-	if *password != "" {
-		return []byte(*password), nil
-	}
-
-	fmt.Print("Enter Password: ")
-	password, e := terminal.ReadPassword(int(syscall.Stdin))
-	fmt.Println()
-	return password, e
-}
-
-func encryptFile(inputFile string, inputFileStats os.FileInfo, outputFile string, encrypter *encrypt.Encrypter) error {
-	input, e := os.Open(inputFile)
+	plaintext, e := readAllFileContent(plainFilepath)
 	if e != nil {
 		return e
+	}
+
+	cyphertext, e := encrypter.Encrypt(plaintext)
+	if e != nil {
+		return e
+	}
+
+	return writeToFile(cypherFilepath, cyphertext)
+}
+
+// DecryptFile will decrypt the file at cypherFilepath and put the content in the file at plainFilepath.
+// If plainFilepath already exists, it will overwrite its content. Otherwise it will create it and any subfolder
+// required.
+func DecryptFile(cypherFilepath string, plainFilepath string, decrypter *encrypt.Decrypter) error {
+
+	cyphertext, e := readAllFileContent(cypherFilepath)
+	if e != nil {
+		return e
+	}
+
+	plaintext, e := decrypter.Decrypt(cyphertext)
+	if e != nil {
+		return e
+	}
+
+	return writeToFile(plainFilepath, plaintext)
+}
+
+func readAllFileContent(inputFilepath string) ([]byte, error) {
+	fin, e := os.Open(inputFilepath)
+	if e != nil {
+		return nil, e
 	}
 	defer func(input *os.File) {
 		input.Close()
-	}(input)
+	}(fin)
+
+	inputFileStats, e := os.Stat(inputFilepath)
+	if e != nil {
+		return nil, e
+	}
 
 	buffer := make([]byte, inputFileStats.Size())
-	n, e := input.Read(buffer)
+	n, e := fin.Read(buffer)
+	if e != nil {
+		return nil, e
+	}
+
+	// Opening a file in Go will not lock it from concurrent access (verified by test and by reading the Windows and
+	// Linux implementation code as of Go V1.10). That's why we're a bit more careful to ensure that the file is not
+	// being modified concurrently as the encrypted content could be corrupted.
+	if n != len(buffer) {
+		return nil, fmt.Errorf("file change detected during encryption (shorter than expected)")
+	}
+
+	extra := make([]byte, 1)
+	n, e = fin.Read(extra)
+	if n != 0 {
+		return nil, fmt.Errorf("file change detected during encryption (larger than expected)")
+	} else if e != io.EOF {
+		return nil, fmt.Errorf("file change detected during encryption (unexpected error): %v", e)
+	}
+
+	return buffer, nil
+}
+
+func writeToFile(fpOut string, content []byte) error {
+	// Create the directory if needed
+	// Note: perm is ignored on windows as of Go V1.10
+	e := os.MkdirAll(filepath.Dir(fpOut), 0600) // TODO: allow custom file permission
 	if e != nil {
 		return e
 	}
 
-	if int64(n) != inputFileStats.Size() {
-		// TODO: This should be based on a stream or support multiple calls to encrypt.
-		return fmt.Errorf("unexpected file length change")
-	}
-
-	logger.Printf("Encrypting file '%s'...", inputFile)
-	cyphertext, e := encrypter.Encrypt(buffer)
-	if e != nil {
-		return e
-	}
-
-	output, e := os.Create(outputFile)
+	// Will truncate the file if it exists.
+	fout, e := os.Create(fpOut)
 	if e != nil {
 		return e
 	}
 	defer func(output *os.File) {
 		output.Close()
-	}(output)
+	}(fout)
 
-	_, e = output.Write(cyphertext)
-	logger.Print("Done")
-
+	_, e = fout.Write(content)
 	return e
 }
